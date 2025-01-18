@@ -20,8 +20,18 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = '7332216298:AAEj0787aEQPDjd7qJqgLgzW7ha6l5p7dTs'
 bot = telebot.TeleBot(BOT_TOKEN)
 
-# Solana RPC endpoint
-SOLANA_RPC_URL = "https://api.devnet.solana.com"
+# Changed to Mainnet RPC endpoint
+SOLANA_RPC_URL = "https://api.mainnet-beta.solana.com"
+
+def get_solana_price():
+    try:
+        url = "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd"
+        response = requests.get(url)
+        data = response.json()
+        return data['solana']['usd']
+    except Exception as e:
+        logger.error(f"Error fetching SOL price: {str(e)}")
+        return None
 
 def is_valid_solana_address(address):
     logger.info(f"Validating Solana address: {address}")
@@ -65,7 +75,11 @@ def send_welcome(message):
     username = message.from_user.username
     logger.info(f"New user started bot - ID: {user_id}, Username: @{username}")
     
-    welcome_msg = "👋 Welcome! I can help you check your Solana wallet balance.\n\nPlease enter your Solana wallet address."
+    welcome_msg = (
+        "👋 Welcome to Solana Balance Checker!\n\n"
+        "I can help you check your Solana wallet balance on Mainnet.\n"
+        "Please enter your Solana wallet address."
+    )
     bot.reply_to(message, welcome_msg)
     logger.info(f"Sent welcome message to user {user_id}")
 
@@ -90,13 +104,32 @@ def handle_wallet_address(message):
         if 'result' in response and 'value' in response['result']:
             balance_in_lamports = response['result']['value']
             balance_in_sol = balance_in_lamports / 1_000_000_000
-            response_msg = f"💰 Wallet Balance:\n{balance_in_sol:.9f} SOL"
+            
+            # Get SOL price and calculate USD value
+            sol_price = get_solana_price()
+            if sol_price:
+                usd_value = balance_in_sol * sol_price
+                response_msg = (
+                    f"💰 Wallet Balance for:\n"
+                    f"`{wallet_address}`\n\n"
+                    f"Balance: **{balance_in_sol:.4f} SOL**\n"
+                    f"Value: **${usd_value:.2f} USD**\n\n"
+                    f"_Checked on Solana Mainnet_"
+                )
+            else:
+                response_msg = (
+                    f"💰 Wallet Balance for:\n"
+                    f"`{wallet_address}`\n\n"
+                    f"Balance: **{balance_in_sol:.4f} SOL**\n"
+                    f"_(USD value unavailable)_"
+                )
+            
             logger.info(f"Balance retrieved successfully - Address: {wallet_address}, Balance: {balance_in_sol} SOL")
         else:
             response_msg = "Account not found or has no balance."
             logger.warning(f"No balance found for address: {wallet_address}")
             
-        bot.reply_to(message, response_msg)
+        bot.reply_to(message, response_msg, parse_mode='Markdown')
         logger.info(f"Sent balance response to user {user_id}")
         
     except Exception as e:
