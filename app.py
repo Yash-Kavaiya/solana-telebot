@@ -11,6 +11,7 @@ from dataclasses import dataclass
 import threading
 from functools import wraps
 import time
+from logging.handlers import RotatingFileHandler, TimedRotatingFileHandler
 
 # Constants
 class Config:
@@ -280,7 +281,8 @@ def setup_logging() -> None:
         level=logging.INFO,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
         handlers=[
-            logging.FileHandler(Config.LOG_PATH),
+            RotatingFileHandler(Config.LOG_PATH, maxBytes=5*1024*1024, backupCount=5),
+            TimedRotatingFileHandler(Config.LOG_PATH, when='midnight', interval=1, backupCount=5),
             logging.StreamHandler()
         ]
     )
