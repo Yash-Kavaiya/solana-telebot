@@ -1,154 +1,309 @@
+from abc import ABC, abstractmethod
 import telebot
 import requests
 import base58
 import logging
 import json
 from datetime import datetime
+import sqlite3
+from typing import Dict, Any, Optional, List
+from dataclasses import dataclass
+import threading
+from functools import wraps
+import time
 
-# Set up logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('bot_logs.txt'),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger(__name__)
+# Constants
+class Config:
+    BOT_TOKEN = '7332216298:AAEj0787aEQPDjd7qJqgLgzW7ha6l5p7dTs'
+    SOLANA_MAINNET_URL = "https://api.mainnet-beta.solana.com"
+    COINGECKO_API_URL = "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd"
+    DB_PATH = 'bot_metrics.db'
+    LOG_PATH = 'bot.log'
 
-# Initialize your Telegram bot with your bot token
-BOT_TOKEN = '7332216298:AAEj0787aEQPDjd7qJqgLgzW7ha6l5p7dTs'
-bot = telebot.TeleBot(BOT_TOKEN)
+# Domain Models
+@dataclass
+class WalletBalance:
+    address: str
+    sol_balance: float
+    usd_value: Optional[float] = None
 
-# Changed to Mainnet RPC endpoint
-SOLANA_RPC_URL = "https://api.mainnet-beta.solana.com"
+@dataclass
+class UserRequest:
+    user_id: int
+    username: str
+    wallet_address: str
+    timestamp: datetime
 
-def get_solana_price():
-    try:
-        url = "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd"
-        response = requests.get(url)
+# Interfaces
+class IDatabase(ABC):
+    @abstractmethod
+    def save_metrics(self, metrics: Dict[str, Any]) -> None:
+        pass
+
+    @abstractmethod
+    def get_metrics(self) -> Dict[str, Any]:
+        pass
+
+class IBlockchainClient(ABC):
+    @abstractmethod
+    def get_balance(self, address: str) -> float:
+        pass
+
+class IPriceOracle(ABC):
+    @abstractmethod
+    def get_sol_price(self) -> Optional[float]:
+        pass
+
+# Implementations
+class SQLiteDatabase(IDatabase):
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        self._init_db()
+
+    def _init_db(self) -> None:
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS metrics (
+                    timestamp TEXT,
+                    metric_name TEXT,
+                    metric_value REAL,
+                    PRIMARY KEY (timestamp, metric_name)
+                )
+            ''')
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS wallet_checks (
+                    address TEXT,
+                    timestamp TEXT,
+                    balance REAL,
+                    user_id INTEGER
+                )
+            ''')
+
+    def _get_connection(self):
+        return sqlite3.connect(self.db_path)
+
+    def save_metrics(self, metrics: Dict[str, Any]) -> None:
+        timestamp = datetime.now().isoformat()
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            for metric_name, value in metrics.items():
+                cursor.execute(
+                    'INSERT OR REPLACE INTO metrics VALUES (?, ?, ?)',
+                    (timestamp, metric_name, float(value))
+                )
+
+    def get_metrics(self) -> Dict[str, Any]:
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                'SELECT metric_name, metric_value FROM metrics WHERE timestamp = (SELECT MAX(timestamp) FROM metrics)'
+            )
+            return dict(cursor.fetchall())
+
+class SolanaClient(IBlockchainClient):
+    def __init__(self, rpc_url: str):
+        self.rpc_url = rpc_url
+
+    def get_balance(self, address: str) -> float:
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getBalance",
+            "params": [address]
+        }
+        response = requests.post(self.rpc_url, json=payload)
+        response.raise_for_status()
         data = response.json()
-        return data['solana']['usd']
-    except Exception as e:
-        logger.error(f"Error fetching SOL price: {str(e)}")
-        return None
+        if 'result' not in data or 'value' not in data['result']:
+            raise ValueError("Invalid response from Solana RPC")
+        return data['result']['value'] / 1_000_000_000  # Convert lamports to SOL
 
-def is_valid_solana_address(address):
-    logger.info(f"Validating Solana address: {address}")
-    try:
-        decoded = base58.b58decode(address)
-        is_valid = len(decoded) == 32
-        logger.info(f"Address validation result: {is_valid}")
-        return is_valid
-    except Exception as e:
-        logger.error(f"Address validation error: {str(e)}")
-        return False
+class CoinGeckoPriceOracle(IPriceOracle):
+    def __init__(self, api_url: str):
+        self.api_url = api_url
 
-def get_solana_balance(address):
-    logger.info(f"Fetching balance for address: {address}")
-    headers = {"Content-Type": "application/json"}
-    payload = {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "getBalance",
-        "params": [address]
-    }
-    
-    try:
-        logger.info(f"Making RPC request to {SOLANA_RPC_URL}")
-        logger.debug(f"Request payload: {json.dumps(payload, indent=2)}")
-        
-        response = requests.post(SOLANA_RPC_URL, headers=headers, json=payload)
-        response_json = response.json()
-        
-        logger.info(f"RPC response received. Status code: {response.status_code}")
-        logger.debug(f"Response data: {json.dumps(response_json, indent=2)}")
-        
-        return response_json
-    except Exception as e:
-        logger.error(f"RPC request failed: {str(e)}")
-        raise
+    def get_sol_price(self) -> Optional[float]:
+        try:
+            response = requests.get(self.api_url)
+            response.raise_for_status()
+            data = response.json()
+            return data['solana']['usd']
+        except Exception as e:
+            logging.error(f"Error fetching SOL price: {e}")
+            return None
 
-@bot.message_handler(commands=['start'])
-def send_welcome(message):
-    user_id = message.from_user.id
-    username = message.from_user.username
-    logger.info(f"New user started bot - ID: {user_id}, Username: @{username}")
-    
-    welcome_msg = (
-        "👋 Welcome to Solana Balance Checker!\n\n"
-        "I can help you check your Solana wallet balance on Mainnet.\n"
-        "Please enter your Solana wallet address."
-    )
-    bot.reply_to(message, welcome_msg)
-    logger.info(f"Sent welcome message to user {user_id}")
+# Service Layer
+class MetricsService:
+    def __init__(self, database: IDatabase):
+        self.database = database
+        self.metrics = {
+            'total_requests': 0,
+            'active_users': set(),
+            'unique_addresses': set(),
+            'total_sol_checked': 0,
+            'successful_requests': 0,
+            'failed_requests': 0
+        }
+        self._lock = threading.Lock()
 
-@bot.message_handler(func=lambda message: True)
-def handle_wallet_address(message):
-    user_id = message.from_user.id
-    username = message.from_user.username
-    wallet_address = message.text.strip()
-    
-    logger.info(f"Processing wallet request - User ID: {user_id}, Username: @{username}")
-    logger.info(f"Received wallet address: {wallet_address}")
-    
-    if not is_valid_solana_address(wallet_address):
-        logger.warning(f"Invalid address provided by user {user_id}: {wallet_address}")
-        bot.reply_to(message, "❌ Invalid Solana wallet address. Please enter a valid address.")
-        return
-    
-    try:
-        logger.info(f"Fetching balance for valid address: {wallet_address}")
-        response = get_solana_balance(wallet_address)
-        
-        if 'result' in response and 'value' in response['result']:
-            balance_in_lamports = response['result']['value']
-            balance_in_sol = balance_in_lamports / 1_000_000_000
-            
-            # Get SOL price and calculate USD value
-            sol_price = get_solana_price()
-            if sol_price:
-                usd_value = balance_in_sol * sol_price
-                response_msg = (
-                    f"💰 Wallet Balance for:\n"
-                    f"`{wallet_address}`\n\n"
-                    f"Balance: **{balance_in_sol:.4f} SOL**\n"
-                    f"Value: **${usd_value:.2f} USD**\n\n"
-                    f"_Checked on Solana Mainnet_"
-                )
+    def update_metric(self, metric_name: str, value: Any) -> None:
+        with self._lock:
+            if isinstance(self.metrics[metric_name], set):
+                self.metrics[metric_name].add(value)
             else:
-                response_msg = (
-                    f"💰 Wallet Balance for:\n"
-                    f"`{wallet_address}`\n\n"
-                    f"Balance: **{balance_in_sol:.4f} SOL**\n"
-                    f"_(USD value unavailable)_"
-                )
-            
-            logger.info(f"Balance retrieved successfully - Address: {wallet_address}, Balance: {balance_in_sol} SOL")
-        else:
-            response_msg = "Account not found or has no balance."
-            logger.warning(f"No balance found for address: {wallet_address}")
-            
-        bot.reply_to(message, response_msg, parse_mode='Markdown')
-        logger.info(f"Sent balance response to user {user_id}")
+                self.metrics[metric_name] += value
+
+    def save_current_metrics(self) -> None:
+        metrics_to_save = {}
+        with self._lock:
+            for metric, value in self.metrics.items():
+                metrics_to_save[metric] = len(value) if isinstance(value, set) else value
+        self.database.save_metrics(metrics_to_save)
+
+class WalletService:
+    def __init__(
+        self,
+        blockchain_client: IBlockchainClient,
+        price_oracle: IPriceOracle
+    ):
+        self.blockchain_client = blockchain_client
+        self.price_oracle = price_oracle
+
+    @staticmethod
+    def is_valid_address(address: str) -> bool:
+        try:
+            decoded = base58.b58decode(address)
+            return len(decoded) == 32
+        except Exception:
+            return False
+
+    def get_wallet_balance(self, address: str) -> WalletBalance:
+        sol_balance = self.blockchain_client.get_balance(address)
+        sol_price = self.price_oracle.get_sol_price()
+        usd_value = sol_balance * sol_price if sol_price else None
+        return WalletBalance(address, sol_balance, usd_value)
+
+# Telegram Bot Implementation
+class SolanaBot:
+    def __init__(
+        self,
+        token: str,
+        wallet_service: WalletService,
+        metrics_service: MetricsService
+    ):
+        self.bot = telebot.TeleBot(token)
+        self.wallet_service = wallet_service
+        self.metrics_service = metrics_service
+        self._setup_handlers()
+        self._setup_metrics_saving()
+
+    def _setup_metrics_saving(self) -> None:
+        def save_metrics_periodically():
+            while True:
+                self.metrics_service.save_current_metrics()
+                time.sleep(60)
         
-    except Exception as e:
-        error_msg = f"❌ Error fetching wallet balance: {str(e)}"
-        logger.error(f"Error processing request for user {user_id}: {str(e)}", exc_info=True)
-        bot.reply_to(message, error_msg)
+        thread = threading.Thread(
+            target=save_metrics_periodically,
+            daemon=True
+        )
+        thread.start()
+
+    def _setup_handlers(self) -> None:
+        @self.bot.message_handler(commands=['start'])
+        def handle_start(message):
+            user_id = message.from_user.id
+            self.metrics_service.update_metric('active_users', user_id)
+            welcome_msg = (
+                "👋 Welcome to Solana Balance Checker!\n\n"
+                "I can help you check your Solana wallet balance on Mainnet.\n"
+                "Please enter your Solana wallet address."
+            )
+            self.bot.reply_to(message, welcome_msg)
+
+        @self.bot.message_handler(func=lambda m: True)
+        def handle_wallet_address(message):
+            try:
+                self._process_wallet_request(message)
+            except Exception as e:
+                logging.error(f"Error processing request: {e}", exc_info=True)
+                self.bot.reply_to(
+                    message,
+                    "❌ An error occurred while processing your request."
+                )
+
+    def _process_wallet_request(self, message) -> None:
+        user_id = message.from_user.id
+        wallet_address = message.text.strip()
+        
+        self.metrics_service.update_metric('total_requests', 1)
+        
+        if not self.wallet_service.is_valid_address(wallet_address):
+            self.metrics_service.update_metric('failed_requests', 1)
+            self.bot.reply_to(
+                message,
+                "❌ Invalid Solana wallet address. Please enter a valid address."
+            )
+            return
+
+        try:
+            balance = self.wallet_service.get_wallet_balance(wallet_address)
+            self.metrics_service.update_metric('successful_requests', 1)
+            self.metrics_service.update_metric('unique_addresses', wallet_address)
+            self.metrics_service.update_metric('total_sol_checked', balance.sol_balance)
+
+            response_msg = (
+                f"💰 Wallet Balance for:\n"
+                f"`{balance.address}`\n\n"
+                f"Balance: **{balance.sol_balance:.4f} SOL**\n"
+            )
+
+            if balance.usd_value:
+                response_msg += f"Value: **${balance.usd_value:.2f} USD**\n"
+
+            response_msg += "\n_Checked on Solana Mainnet_"
+            
+            self.bot.reply_to(message, response_msg, parse_mode='Markdown')
+            
+        except Exception as e:
+            self.metrics_service.update_metric('failed_requests', 1)
+            raise
+
+    def run(self) -> None:
+        logging.info("Starting Solana Balance Bot...")
+        self.bot.polling(none_stop=True)
+
+# Main Application
+def setup_logging() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(Config.LOG_PATH),
+            logging.StreamHandler()
+        ]
+    )
 
 def main():
-    logger.info("=== Bot Starting ===")
-    logger.info(f"Start Time: {datetime.now()}")
-    logger.info(f"Bot Username: @{bot.get_me().username}")
+    setup_logging()
+    
+    # Initialize dependencies
+    database = SQLiteDatabase(Config.DB_PATH)
+    blockchain_client = SolanaClient(Config.SOLANA_MAINNET_URL)
+    price_oracle = CoinGeckoPriceOracle(Config.COINGECKO_API_URL)
+    
+    # Initialize services
+    metrics_service = MetricsService(database)
+    wallet_service = WalletService(blockchain_client, price_oracle)
+    
+    # Initialize and run bot
+    bot = SolanaBot(Config.BOT_TOKEN, wallet_service, metrics_service)
     
     try:
-        logger.info("Starting bot polling...")
-        bot.polling(none_stop=True)
+        bot.run()
     except Exception as e:
-        logger.error(f"Critical bot error: {str(e)}", exc_info=True)
-    finally:
-        logger.info("=== Bot Stopped ===")
+        logging.error(f"Critical error: {e}", exc_info=True)
 
 if __name__ == "__main__":
     main()
