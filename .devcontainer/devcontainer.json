@@ -1,0 +1,5 @@
+{
+  "tasks": {
+    "launch": "BOT_TOKEN=7332216298:AAEj0787aEQPDjd7qJqgLgzW7ha6l5p7dTs SOLANA_RPC_URL=https://api.mainnet-beta.solana.com python app.py"
+  }
+}
